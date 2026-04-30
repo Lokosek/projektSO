@@ -618,7 +618,7 @@ static int parse_args(int argc, char **argv, bool *recursive, unsigned int *slee
         }
     }
 
-    if (argc - optind < 2) {
+    if (argc - optind != 2) {
         return -1;
     }
 
@@ -662,6 +662,23 @@ int main(int argc, char **argv) {
         dprintf(STDERR_FILENO, "Blad: '%s' nie jest katalogiem.\n", dst_path);
         return EXIT_FAILURE;
     }
+    // Zamieniamy ścieżki na bezwzględne przed daemonizacją.
+// Po daemonizacji proces wykona chdir("/"), więc ścieżki względne mogłyby przestać działać.
+    char src_abs[PATH_MAX];
+    char dst_abs[PATH_MAX];
+    
+    if (realpath(src_path, src_abs) == NULL) {
+        dprintf(STDERR_FILENO, "Blad realpath dla zrodla '%s': %s\n", src_path, strerror(errno));
+        return EXIT_FAILURE;
+    }
+    
+    if (realpath(dst_path, dst_abs) == NULL) {
+        dprintf(STDERR_FILENO, "Blad realpath dla celu '%s': %s\n", dst_path, strerror(errno));
+        return EXIT_FAILURE;
+    }
+    
+    src_path = src_abs;
+    dst_path = dst_abs;
 
     // Zamieniamy proces foreground na poprawnego demona.
     if (daemonize_process() < 0) {
