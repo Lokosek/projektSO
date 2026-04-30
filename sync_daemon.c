@@ -448,7 +448,7 @@ static int sync_dirs(const char *src_dir, const char *dst_dir, bool recursive, s
                 log_with_date(LOG_WARNING, "Nie mozna przygotowac katalogu '%s': %s", dst_path, strerror(errno));
                 continue;
             }
-            // Po wybudzeniu wykonujemy pojedynczy cykl synchronizacji drzew katalogow.
+              // Rekurencyjnie synchronizujemy znaleziony podkatalog.
         if (sync_dirs(src_path, dst_path, recursive, mmap_threshold) < 0) {
                 log_with_date(LOG_WARNING, "Blad synchronizacji podkatalogu '%s'", src_path);
             }
@@ -663,7 +663,7 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     // Zamieniamy ścieżki na bezwzględne przed daemonizacją.
-// Po daemonizacji proces wykona chdir("/"), więc ścieżki względne mogłyby przestać działać.
+    // Po daemonizacji proces wykona chdir("/"), więc ścieżki względne mogłyby przestać działać.
     char src_abs[PATH_MAX];
     char dst_abs[PATH_MAX];
     
