@@ -1,5 +1,28 @@
 #define _GNU_SOURCE
-// Wlaczenie rozszerzen GNU, aby miec dostep m.in. do utimensat/localtime_r.
+/*
+ * Demon synchronizujący dwa katalogi.
+ *
+ * Program przyjmuje ścieżkę katalogu źródłowego i docelowego.
+ * Po poprawnej walidacji uruchamia się jako demon, czyli proces działający w tle.
+ *
+ * Demon cyklicznie:
+ * - zasypia na określoną liczbę sekund,
+ * - po obudzeniu porównuje katalog źródłowy z docelowym,
+ * - kopiuje nowe lub zmienione pliki,
+ * - usuwa z katalogu docelowego pliki, których nie ma już w źródle.
+ *
+ * Opcje:
+ * -R             synchronizacja rekurencyjna podkatalogów,
+ * -s sekundy     czas uśpienia demona,
+ * -m bajty       próg rozmiaru pliku, od którego używane jest mmap.
+ *
+ * Sygnały:
+ * SIGUSR1        natychmiastowe wybudzenie demona,
+ * SIGTERM/SIGINT zakończenie działania demona.
+ *
+ * Małe pliki kopiowane są przez read/write.
+ * Duże pliki kopiowane są przez mmap/write.
+ */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -21,32 +44,32 @@
 #define DEFAULT_SLEEP_SECONDS 300
 #define DEFAULT_MMAP_THRESHOLD (1024 * 1024)
 
+/*
+ * Flagi ustawiane przez sygnały.
+ * Muszą być sig_atomic_t, bo są modyfikowane asynchronicznie z handlera.
+ */
 static volatile sig_atomic_t g_wake_requested = 0;
 static volatile sig_atomic_t g_stop_requested = 0;
 
 /*
- * Obsluga sygnalow procesu-demona:
- * - SIGUSR1: natychmiastowe wybudzenie z sleep.
- * - SIGTERM/SIGINT: prosba o zakonczenie petli glownej.
+ * Handler sygnałów:
+ * - SIGUSR1: tylko budzi demona przed końcem sleep,
+ * - SIGTERM/SIGINT: ustawia zakończenie i również wybudza pętlę.
  */
 static void signal_handler(int signo) {
-    // SIGUSR1 nie konczy procesu - tylko ustawia flage szybkiego wybudzenia.
     if (signo == SIGUSR1) {
-        // Flaga jest typu sig_atomic_t, wiec zapis jest bezpieczny w handlerze.
         g_wake_requested = 1;
     } else if (signo == SIGTERM || signo == SIGINT) {
         g_stop_requested = 1;
-        // Flaga jest typu sig_atomic_t, wiec zapis jest bezpieczny w handlerze.
         g_wake_requested = 1;
     }
 }
 
 /*
- * Logowanie do sysloga z dopisana data i czasem (wlasny prefiks czasowy).
+ * Prosty wrapper na syslog: każdy komunikat dostaje własny znacznik daty/godziny.
  */
 static void log_with_date(int priority, const char *fmt, ...) {
     char timebuf[64];
-    // Pobieramy aktualny czas systemowy do prefiksu logu.
     time_t now = time(NULL);
     struct tm tm_now;
 
@@ -68,10 +91,9 @@ static void log_with_date(int priority, const char *fmt, ...) {
 }
 
 /*
- * Buduje sciezke "dir/name" do bufora out i pilnuje limitu PATH_MAX.
+ * Łączy katalog + nazwę wpisu do jednej ścieżki i pilnuje przepełnienia bufora.
  */
 static int join_path(char *out, size_t out_sz, const char *dir, const char *name) {
-    // Sprawdzamy czy dir konczy sie "/": jesli nie, trzeba go dodac.
     size_t dlen = strlen(dir);
     int needs_slash = (dlen > 0 && dir[dlen - 1] != '/');
     int written = snprintf(out, out_sz, "%s%s%s", dir, needs_slash ? "/" : "", name);
@@ -82,19 +104,23 @@ static int join_path(char *out, size_t out_sz, const char *dir, const char *name
     return 0;
 }
 
+/*
+ * Ustawia w pliku docelowym te same czasy dostępu/modyfikacji co w źródle.
+ * Dzięki temu przy następnym przebiegu nie kopiujemy bez potrzeby.
+ */
 static int set_dest_timestamps(const char *dst_path, const struct stat *src_st) {
-    // [0] atime, [1] mtime - kopiujemy czasy ze zrodla 1:1.
     struct timespec ts[2];
     ts[0] = src_st->st_atim;
     ts[1] = src_st->st_mtim;
     return utimensat(AT_FDCWD, dst_path, ts, 0);
 }
 
-/* Kopiowanie malego pliku klasycznym read/write. */
+/*
+ * Kopiowanie „małego” pliku klasycznie przez read/write w pętli.
+ */
 static int copy_small_rw(int src_fd, int dst_fd) {
     char buf[8192];
     while (1) {
-        // Czytamy kolejny blok danych ze zrodla.
         ssize_t rd = read(src_fd, buf, sizeof(buf));
         if (rd == 0) {
             return 0;
@@ -121,7 +147,10 @@ static int copy_small_rw(int src_fd, int dst_fd) {
     }
 }
 
-/* Kopiowanie duzego pliku: mmap zrodla + write do celu. */
+/*
+ * Kopiowanie „dużego” pliku:
+ * mapujemy całe źródło (mmap), a następnie wypychamy bajty write() do celu.
+ */
 static int copy_large_mmap(int src_fd, int dst_fd, off_t size) {
     if (size == 0) {
         return 0;
@@ -156,8 +185,8 @@ static int copy_large_mmap(int src_fd, int dst_fd, off_t size) {
 }
 
 /*
- * Kopiuje pojedynczy plik regularny i zachowuje tryb + znaczniki czasu.
- * Strategia kopiowania jest wybierana progiem mmap_threshold.
+ * Kopiuje pojedynczy plik źródło->cel i dobiera metodę kopii wg progu -m.
+ * Dodatkowo zachowuje tryb (chmod) i czasy (utimensat).
  */
 static int copy_file(const char *src_path, const char *dst_path, size_t mmap_threshold, const struct stat *src_st) {
     int src_fd = -1;
@@ -220,9 +249,12 @@ cleanup:
 
 static int remove_tree(const char *path);
 
+/*
+ * Dla trybu -R: zapewnia, że w katalogu docelowym istnieje dany podkatalog.
+ * Jeśli pod tą nazwą istnieje inny typ obiektu, usuwa go i tworzy katalog.
+ */
 static int ensure_dir_exists(const char *path, mode_t mode) {
     struct stat st;
-    // Istnieje cos pod ta sciezka - sprawdzamy czy to juz katalog.
     if (lstat(path, &st) == 0) {
         if (S_ISDIR(st.st_mode)) {
             return 0;
@@ -249,6 +281,13 @@ static int ensure_dir_exists(const char *path, mode_t mode) {
     return 0;
 }
 
+/*
+ * Decyzja „czy kopiować plik”:
+ * - brak pliku w celu -> kopiujemy,
+ * - inny typ obiektu w celu -> usuwamy i kopiujemy,
+ * - starszy mtime lub inny rozmiar -> kopiujemy,
+ * - w przeciwnym razie pomijamy.
+ */
 static int maybe_copy_regular(const char *src_path, const char *dst_path, size_t mmap_threshold) {
     struct stat src_st;
     struct stat dst_st;
@@ -292,7 +331,10 @@ static int maybe_copy_regular(const char *src_path, const char *dst_path, size_t
     return copy_file(src_path, dst_path, mmap_threshold, &src_st);
 }
 
-/* Rekurencyjnie usuwa plik/katalog wraz z calym poddrzewem. */
+/*
+ * Rekurencyjne usuwanie dowolnego poddrzewa w katalogu docelowym.
+ * Używane, gdy w trybie -R znajdziemy katalog/docelowy element bez odpowiednika w źródle.
+ */
 static int remove_tree(const char *path) {
     struct stat st;
     if (lstat(path, &st) < 0) {
@@ -356,12 +398,17 @@ static int remove_tree(const char *path) {
 }
 
 /*
- * Synchronizuje dwa katalogi:
- * 1) przejscie po zrodle i kopiowanie/rekurencja,
- * 2) przejscie po celu i usuwanie elementow nadmiarowych.
+ * Główna funkcja synchronizacji katalogów.
+ *
+ * Etap 1 (przejście po źródle):
+ * - pliki regularne: decyzja/copy,
+ * - katalogi (tylko -R): tworzenie brakujących i synchronizacja podkatalogu.
+ *
+ * Etap 2 (przejście po celu):
+ * - usuwanie obiektów, których nie ma już w źródle,
+ * - przy -R także usuwanie całych nadmiarowych podkatalogów.
  */
 static int sync_dirs(const char *src_dir, const char *dst_dir, bool recursive, size_t mmap_threshold) {
-    // Etap 1: przechodzimy po zrodle i doprowadzamy cel do co najmniej takiego stanu.
     DIR *src = opendir(src_dir);
     if (!src) {
         log_with_date(LOG_ERR, "Nie mozna otworzyc katalogu zrodla '%s': %s", src_dir, strerror(errno));
@@ -470,10 +517,14 @@ static int sync_dirs(const char *src_dir, const char *dst_dir, bool recursive, s
 }
 
 /*
- * Klasyczna daemonizacja: double-fork + setsid + odpiecie od terminala.
+ * Klasyczna daemonizacja (double-fork):
+ * 1) fork + wyjście rodzica,
+ * 2) setsid() -> nowa sesja i brak controlling terminal,
+ * 3) drugi fork -> brak możliwości odzyskania terminala,
+ * 4) chdir("/"), umask(0),
+ * 5) podpięcie stdin/stdout/stderr do /dev/null.
  */
 static int daemonize_process(void) {
-    // Pierwszy fork oddziela proces od rodzica wywolujacego.
     pid_t pid = fork();
     if (pid < 0) {
         return -1;
@@ -524,8 +575,10 @@ static int daemonize_process(void) {
 }
 
 /*
- * Parsowanie argumentow CLI:
- * -R, -s, -m oraz dwie sciezki katalogow.
+ * Parsowanie argumentów.
+ * -R: włącza rekurencyjną synchronizację.
+ * -s: ustawia czas snu między przebiegami synchronizacji.
+ * -m: ustawia próg bajtów dla wyboru mmap.
  */
 static int parse_args(int argc, char **argv, bool *recursive, unsigned int *sleep_seconds,
                       size_t *mmap_threshold, const char **src, const char **dst) {
@@ -575,8 +628,11 @@ static int parse_args(int argc, char **argv, bool *recursive, unsigned int *slee
 }
 
 /*
- * Punkt startowy programu: walidacja, daemonizacja, instalacja sygnalow
- * i nieskonczona petla usypiania + synchronizacji.
+ * Punkt wejścia:
+ * 1) walidacja argumentów i katalogów,
+ * 2) daemonizacja,
+ * 3) konfiguracja sysloga i sygnałów,
+ * 4) pętla: sleep -> wybudzenie naturalne/sygnałowe -> synchronizacja.
  */
 int main(int argc, char **argv) {
     bool recursive;
