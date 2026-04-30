@@ -628,6 +628,24 @@ static int parse_args(int argc, char **argv, bool *recursive, unsigned int *slee
 }
 
 /*
+ * Sprawdza, czy parent jest katalogiem nadrzędnym dla child.
+ * Porównanie działa na ścieżkach bezwzględnych z realpath().
+ *
+ * Przykład:
+ * parent = /home/user/src
+ * child  = /home/user/src/kopia
+ * wynik  = true
+ */
+ static bool is_path_prefix_component(const char *parent, const char *child) {
+    size_t len = strlen(parent);
+
+    if (strncmp(parent, child, len) != 0) {
+        return false;
+    }
+
+    return child[len] == '/';
+}
+/*
  * Punkt wejścia:
  * 1) walidacja argumentów i katalogów,
  * 2) daemonizacja,
@@ -679,6 +697,14 @@ int main(int argc, char **argv) {
     
     src_path = src_abs;
     dst_path = dst_abs;
+    
+    if (strcmp(src_path, dst_path) == 0 ||
+    is_path_prefix_component(src_path, dst_path) ||
+    is_path_prefix_component(dst_path, src_path)) {
+    dprintf(STDERR_FILENO,
+            "Blad: katalog zrodlowy i docelowy nie moga byc takie same ani zagniezdzone.\n");
+    return EXIT_FAILURE;
+}
 
     // Zamieniamy proces foreground na poprawnego demona.
     if (daemonize_process() < 0) {
