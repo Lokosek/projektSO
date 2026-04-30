@@ -80,6 +80,7 @@ static void log_with_date(int priority, const char *fmt, ...) {
         timebuf[sizeof(timebuf) - 1] = '\0';
     }
 
+    // Skladamy wiadomosc koncowa z varargs w buforze tymczasowym.
     char msgbuf[1024];
     va_list args;
     va_start(args, fmt);
@@ -133,6 +134,7 @@ static int copy_small_rw(int src_fd, int dst_fd) {
 
         ssize_t written_total = 0;
         while (written_total < rd) {
+            // Zapisujemy tyle, ile zostalo z aktualnie odczytanego bloku.
             ssize_t wr = write(dst_fd, buf + written_total, (size_t)(rd - written_total));
             if (wr < 0) {
                 if (errno == EINTR) {
@@ -154,6 +156,7 @@ static int copy_large_mmap(int src_fd, int dst_fd, off_t size) {
         return 0;
     }
 
+    // Mapujemy cale zrodlo tylko do odczytu; kopiowanie bedzie write() do celu.
     void *map = mmap(NULL, (size_t)size, PROT_READ, MAP_PRIVATE, src_fd, 0);
     if (map == MAP_FAILED) {
         return -1;
@@ -190,18 +193,21 @@ static int copy_file(const char *src_path, const char *dst_path, size_t mmap_thr
     int dst_fd = -1;
     int rc = -1;
 
+    // Otwieramy zrodlo do odczytu binarnego.
     src_fd = open(src_path, O_RDONLY);
     if (src_fd < 0) {
         log_with_date(LOG_ERR, "Nie mozna otworzyc zrodla '%s': %s", src_path, strerror(errno));
         goto cleanup;
     }
 
+    // Otwieramy/zakladamy plik docelowy i obcinamy poprzednia zawartosc.
     dst_fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, src_st->st_mode & 0777);
     if (dst_fd < 0) {
         log_with_date(LOG_ERR, "Nie mozna otworzyc celu '%s': %s", dst_path, strerror(errno));
         goto cleanup;
     }
 
+    // Wybor strategii kopiowania na podstawie rozmiaru i progu -m.
     if ((off_t)mmap_threshold > 0 && src_st->st_size >= (off_t)mmap_threshold) {
         if (copy_large_mmap(src_fd, dst_fd, src_st->st_size) < 0) {
             log_with_date(LOG_ERR, "Blad kopiowania mmap '%s' -> '%s': %s", src_path, dst_path, strerror(errno));
@@ -293,6 +299,7 @@ static int maybe_copy_regular(const char *src_path, const char *dst_path, size_t
         return 0;
     }
 
+    // Decyzja biznesowa: czy ten plik trzeba skopiowac w tej iteracji.
     bool need_copy = false;
     if (lstat(dst_path, &dst_st) < 0) {
         if (errno == ENOENT) {
@@ -351,6 +358,7 @@ static int remove_tree(const char *path) {
         return -1;
     }
 
+    // Otwieramy katalog, by przejsc po wszystkich dzieciach i usunac je rekurencyjnie.
     DIR *dir = opendir(path);
     if (!dir) {
         return -1;
@@ -410,6 +418,7 @@ static int sync_dirs(const char *src_dir, const char *dst_dir, bool recursive, s
     struct dirent *ent;
     int rc = 0;
 
+    // Dla kazdego wpisu zrodla: plik -> maybe_copy, katalog -> rekurencja (tylko -R).
     while ((ent = readdir(src)) != NULL) {
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
             continue;
@@ -439,7 +448,8 @@ static int sync_dirs(const char *src_dir, const char *dst_dir, bool recursive, s
                 log_with_date(LOG_WARNING, "Nie mozna przygotowac katalogu '%s': %s", dst_path, strerror(errno));
                 continue;
             }
-            if (sync_dirs(src_path, dst_path, recursive, mmap_threshold) < 0) {
+            // Po wybudzeniu wykonujemy pojedynczy cykl synchronizacji drzew katalogow.
+        if (sync_dirs(src_path, dst_path, recursive, mmap_threshold) < 0) {
                 log_with_date(LOG_WARNING, "Blad synchronizacji podkatalogu '%s'", src_path);
             }
         }
@@ -453,6 +463,7 @@ static int sync_dirs(const char *src_dir, const char *dst_dir, bool recursive, s
         return -1;
     }
 
+    // Etap 2: przechodzimy po celu i usuwamy to, czego nie ma w zrodle.
     DIR *dst = opendir(dst_dir);
     if (!dst) {
         log_with_date(LOG_ERR, "Nie mozna otworzyc katalogu celu '%s': %s", dst_dir, strerror(errno));
@@ -522,10 +533,12 @@ static int daemonize_process(void) {
         _exit(EXIT_SUCCESS);
     }
 
+    // Tworzymy nowa sesje i odcinamy controlling terminal.
     if (setsid() < 0) {
         return -1;
     }
 
+    // Ignorujemy HUP, bo demon nie powinien konczyc po zamknieciu terminala.
     signal(SIGHUP, SIG_IGN);
 
     pid = fork();
@@ -536,12 +549,14 @@ static int daemonize_process(void) {
         _exit(EXIT_SUCCESS);
     }
 
+    // Przechodzimy do / aby nie blokowac montowanego katalogu roboczego.
     if (chdir("/") < 0) {
         return -1;
     }
 
     umask(0);
 
+    // Podpinamy stdin/stdout/stderr pod /dev/null - pelne odpiecie I/O od terminala.
     int devnull = open("/dev/null", O_RDWR);
     if (devnull < 0) {
         return -1;
@@ -572,6 +587,7 @@ static int parse_args(int argc, char **argv, bool *recursive, unsigned int *slee
     *mmap_threshold = DEFAULT_MMAP_THRESHOLD;
 
     int opt;
+    // getopt przetwarza opcje w dowolnej kolejnosci przed argumentami pozycyjnymi.
     while ((opt = getopt(argc, argv, "Rs:m:")) != -1) {
         switch (opt) {
             case 'R':
@@ -579,6 +595,7 @@ static int parse_args(int argc, char **argv, bool *recursive, unsigned int *slee
                 break;
             case 's': {
                 char *end = NULL;
+                // Konwersja interwalu snu (sekundy) z tekstu na liczbe dodatnia.
                 unsigned long value = strtoul(optarg, &end, 10);
                 if (!end || *end != '\0' || value == 0 || value > UINT32_MAX) {
                     return -1;
@@ -588,6 +605,7 @@ static int parse_args(int argc, char **argv, bool *recursive, unsigned int *slee
             }
             case 'm': {
                 char *end = NULL;
+                // Konwersja progu mmap (bajty). 0 oznacza: zawsze read/write.
                 unsigned long long value = strtoull(optarg, &end, 10);
                 if (!end || *end != '\0') {
                     return -1;
@@ -623,6 +641,7 @@ int main(int argc, char **argv) {
     const char *src_path;
     const char *dst_path;
 
+    // Parsujemy opcje i argumenty wymagane; blad => natychmiastowe wyjscie z usage.
     if (parse_args(argc, argv, &recursive, &sleep_seconds, &mmap_threshold, &src_path, &dst_path) < 0) {
         dprintf(STDERR_FILENO,
                 "Uzycie: %s [-R] [-s sekundy] [-m prog_bajtow] <katalog_zrodlowy> <katalog_docelowy>\n",
@@ -633,22 +652,27 @@ int main(int argc, char **argv) {
     struct stat src_st;
     struct stat dst_st;
 
+    // Sprawdzamy czy zrodlo istnieje i jest katalogiem.
     if (stat(src_path, &src_st) < 0 || !S_ISDIR(src_st.st_mode)) {
         dprintf(STDERR_FILENO, "Blad: '%s' nie jest katalogiem.\n", src_path);
         return EXIT_FAILURE;
     }
+    // Sprawdzamy czy cel istnieje i jest katalogiem.
     if (stat(dst_path, &dst_st) < 0 || !S_ISDIR(dst_st.st_mode)) {
         dprintf(STDERR_FILENO, "Blad: '%s' nie jest katalogiem.\n", dst_path);
         return EXIT_FAILURE;
     }
 
+    // Zamieniamy proces foreground na poprawnego demona.
     if (daemonize_process() < 0) {
         dprintf(STDERR_FILENO, "Blad daemonizacji: %s\n", strerror(errno));
         return EXIT_FAILURE;
     }
 
+    // Inicjalizacja logowania do sysloga (facility: daemon).
     openlog("sync_daemon", LOG_PID | LOG_NDELAY, LOG_DAEMON);
 
+    // Rejestrujemy jeden handler dla sygnalow wybudzania i zatrzymania.
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
@@ -665,10 +689,12 @@ int main(int argc, char **argv) {
                   "Demon uruchomiony. SRC='%s' DST='%s' R=%d sleep=%u mmap_threshold=%zu PID=%d",
                   src_path, dst_path, recursive ? 1 : 0, sleep_seconds, mmap_threshold, getpid());
 
+    // Glowna petla pracy demona: sleep -> wake -> sync.
     while (!g_stop_requested) {
         g_wake_requested = 0;
         log_with_date(LOG_INFO, "Demon zasypia na %u sekund.", sleep_seconds);
 
+        // sleep moze zostac przerwany sygnalem - trzymamy pozostaly czas.
         unsigned int remaining = sleep_seconds;
         while (remaining > 0 && !g_wake_requested && !g_stop_requested) {
             remaining = sleep(remaining);
@@ -684,6 +710,7 @@ int main(int argc, char **argv) {
             log_with_date(LOG_INFO, "Demon obudzony naturalnie po uplywie czasu.");
         }
 
+        // Po wybudzeniu wykonujemy pojedynczy cykl synchronizacji drzew katalogow.
         if (sync_dirs(src_path, dst_path, recursive, mmap_threshold) < 0) {
             log_with_date(LOG_ERR, "Synchronizacja zakonczona bledem.");
         }
